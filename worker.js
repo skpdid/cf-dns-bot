@@ -293,7 +293,8 @@ export default {
       const res = await stub.fetch('https://do/handle', {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({ update, env }),
+        // Binding D1 tersedia di env milik Durable Object, bukan dikirim lewat JSON.
+        body: JSON.stringify({ update }),
       });
       if (!res.ok) return new Response('retry', { status: 500 });
       return new Response('ok');
@@ -335,24 +336,29 @@ export class UserBot {
   constructor(state, env) {
     this.state = state;
     this.env = env;
-    this.storage = state.storage;
+    this.storage = state.storage; // legacy, tidak dipakai lagi
   }
 
   async fetch(request) {
-    const { update, env } = await request.json();
+    const { update } = await request.json();
+    // env harus dari this.env: klien tidak bisa mengirim binding Worker lewat JSON.
+    const env = this.env;
     const user = updateUser(update);
     if (!user) return new Response('ok');
     const uidv = String(user.id);
+    this._uid = this._uid || uidv;
 
-    // dedupe
-    const seenKey = `seen:${update.update_id}`;
+    // dedupe (D1)
     if (update.update_id !== undefined) {
-      const seen = await this.storage.get(seenKey);
-      if (seen) {
+      await this.env.DB.prepare('DELETE FROM seen_updates WHERE seen_at < ?')
+        .bind(Date.now() - 3600 * 1000).run();
+      const ins = await this.env.DB.prepare(
+        'INSERT OR IGNORE INTO seen_updates (user_id, update_id, seen_at) VALUES (?, ?, ?)')
+        .bind(uidv, update.update_id, Date.now()).run();
+      if (!ins.meta || ins.meta.changes === 0) {
         if (update.callback_query) await ack(env, update.callback_query.id, '');
         return new Response('ok');
       }
-      await this.storage.put(seenKey, 1);
     }
 
     try {
@@ -382,17 +388,34 @@ export class UserBot {
     return new Response('ok');
   }
 
-  /* --------------------------- state helpers -------------------------- */
+  /* --------------------------- state helpers (D1) --------------------- */
+  uid() { return this._uid; }
+
   async getState() {
-    return (await this.storage.get('state')) || { s: 'home', p: {} };
+    const row = await this.env.DB.prepare('SELECT state FROM sessions WHERE user_id = ?')
+      .bind(this._uid).first();
+    if (!row) return { s: 'home', p: {} };
+    try { return JSON.parse(row.state); } catch { return { s: 'home', p: {} }; }
   }
   async setState(st) {
     st.p = st.p || {};
-    await this.storage.put('state', st);
+    await this.env.DB.prepare(
+      'INSERT INTO sessions (user_id, state, updated_at) VALUES (?, ?, ?) ' +
+      'ON CONFLICT(user_id) DO UPDATE SET state = excluded.state, updated_at = excluded.updated_at')
+      .bind(this._uid, JSON.stringify(st), Date.now()).run();
   }
-  async clearState() { await this.storage.delete('state'); }
-  async getAccounts() { return (await this.storage.get('accounts')) || []; }
-  async setAccounts(list) { await this.storage.put('accounts', list); }
+  async clearState() {
+    await this.env.DB.prepare('DELETE FROM sessions WHERE user_id = ?').bind(this._uid).run();
+  }
+
+  async getAccounts() {
+    const { results } = await this.env.DB.prepare(
+      'SELECT id, name, token, zone_hint AS zoneHint, active FROM accounts WHERE user_id = ? ORDER BY created_at ASC')
+      .bind(this._uid).all();
+    return (results || []).map((r) => ({
+      id: r.id, name: r.name, token: r.token, zoneHint: r.zoneHint, active: !!r.active,
+    }));
+  }
   findAccount(list, id) { return list.find((a) => a.id === id); }
   async cfFor(env, account) {
     return new Cloudflare(await decryptToken(env.ENCRYPTION_KEY, account.token));
@@ -428,7 +451,9 @@ export class UserBot {
       return this.viewHome(env, uidv);
     }
     switch (st.s) {
+      case 'acct_add_name': return this.addAccountName(env, uidv, st, text);
       case 'acct_add_token': return this.addAccountToken(env, uidv, st, text);
+      case 'acct_rename': return this.renameAccount(env, uidv, st, text);
       case 'rec_form': return this.formText(env, uidv, st, text);
       case 'rec_edit_form': return this.formText(env, uidv, st, text);
       default: return this.viewHome(env, uidv);
@@ -450,11 +475,10 @@ export class UserBot {
 
     /* ---- akun ---- */
     if (op === 'ac_add') {
-      st.s = 'acct_add_token'; st.p = {}; await this.setState(st);
+      st.s = 'acct_add_name'; st.p = {}; await this.setState(st);
       return {
-        text: '<b>Tambah akun Cloudflare</b>\n\nKirim <b>API Token</b> Cloudflare.\n'
-          + 'Permission minimal: <code>Zone:Read</code> + <code>DNS:Edit</code>.\n\n'
-          + '<i>Pesan berisi token akan dihapus otomatis setelah diproses.</i>',
+        text: '<b>Tambah akun Cloudflare</b>\n\nKirim <b>Nama akun</b> dulu (bebas, mis. <code>Utama</code>, <code>Kantor</code>).\n'
+          + '<i>Nama ini yang tampil di daftar akun.</i>',
         rows: backCancel(false),
       };
     }
@@ -464,7 +488,7 @@ export class UserBot {
       st.s = 'acct_list'; await this.setState(st);
       return {
         text: `<b>Akun Cloudflare (${accts.length})</b>\nPilih akun untuk melihat detail.`,
-        rows: [...accts.map((a) => [btn(`${a.name}${a.active ? ' ✅' : ''} — ${a.id}`, `ac_sel:${a.id}`)]), backCancel(false)[0]],
+        rows: [...accts.map((a) => [btn(`${a.name}${a.active ? ' ✅' : ''}`, `ac_sel:${a.id}`)]), backCancel(false)[0]],
       };
     }
     if (op === 'ac_sel') {
@@ -473,19 +497,25 @@ export class UserBot {
       if (!a) return this.viewHome(env, uidv);
       st.s = 'acct_one'; st.p = { aid: a.id }; await this.setState(st);
       return {
-        text: `<b>${esc(a.name)}</b>\nID: <code>${a.id}</code>\nStatus: ${a.active ? 'aktif ✅' : 'tidak aktif'}`,
+        text: `<b>${esc(a.name)}</b>\nID: <code>${a.id}</code>\nDomain: ${esc(a.zoneHint || '-')}\nStatus: ${a.active ? 'aktif ✅' : 'tidak aktif'}`,
         rows: [
           [btn('Jadikan aktif', `ac_use:${a.id}`)],
+          [btn('Ganti nama', `ac_ren:${a.id}`)],
           [btn('Hapus akun', `ac_del:${a.id}`)],
           [btn('« Daftar akun', 'ac_list'), btn('Menu', 'home')],
         ],
       };
     }
+    if (op === 'ac_ren') {
+      st.s = 'acct_rename'; st.p = { aid: arg }; await this.setState(st);
+      return { text: 'Kirim nama baru untuk akun ini.', rows: backCancel(false) };
+    }
     if (op === 'ac_use') {
       const accts = await this.getAccounts();
       if (!this.findAccount(accts, arg)) return this.viewHome(env, uidv);
-      for (const a of accts) a.active = a.id === arg;
-      await this.setAccounts(accts);
+      await this.env.DB.prepare(
+        'UPDATE accounts SET active = CASE WHEN id = ? THEN 1 ELSE 0 END WHERE user_id = ?')
+        .bind(arg, uidv).run();
       st.s = 'home'; st.p = {}; await this.setState(st);
       return this.viewHome(env, uidv);
     }
@@ -497,10 +527,13 @@ export class UserBot {
       };
     }
     if (op === 'ac_deldel') {
+      await this.env.DB.prepare('DELETE FROM accounts WHERE user_id = ? AND id = ?')
+        .bind(uidv, arg).run();
       const accts = await this.getAccounts();
-      const next = accts.filter((a) => a.id !== arg);
-      if (!next.some((a) => a.active) && next.length) next[0].active = true;
-      await this.setAccounts(next);
+      if (accts.length && !accts.some((a) => a.active)) {
+        await this.env.DB.prepare('UPDATE accounts SET active = 1 WHERE user_id = ? AND id = ?')
+          .bind(uidv, accts[0].id).run();
+      }
       st.s = 'home'; st.p = {}; await this.setState(st);
       return this.viewHome(env, uidv);
     }
@@ -882,30 +915,80 @@ export class UserBot {
   }
 
   /* ------------------------------ akun add --------------------------- */
+  async addAccountName(env, uidv, st, text) {
+    const name = text.trim().slice(0, 40);
+    if (name.length < 1) return { text: 'Nama tidak boleh kosong.', rows: backCancel(false) };
+    st.s = 'acct_add_token';
+    st.p = { newName: name };
+    await this.setState(st);
+    return {
+      text: `Nama akun: <b>${esc(name)}</b>\n\nSekarang kirim <b>API Token</b> Cloudflare.\n`
+        + 'Permission minimal: <code>Zone:Read</code> + <code>DNS:Edit</code>.\n\n'
+        + '<i>Pesan berisi token akan dihapus otomatis.</i>',
+      rows: backCancel(false),
+    };
+  }
+
   async addAccountToken(env, uidv, st, token) {
     if (!/^[A-Za-z0-9_-]{30,200}$/.test(token)) {
       return { text: 'Format token tidak valid. Coba lagi atau /cancel.', rows: backCancel(false), tokenConsumed: true };
     }
+    const name = String((st.p && st.p.newName) || '').trim().slice(0, 40);
+    if (!name) {
+      st.s = 'acct_add_name'; st.p = {};
+      await this.setState(st);
+      return { text: 'Nama akun hilang. Kirim ulang nama akun.', rows: backCancel(false), tokenConsumed: true };
+    }
+
     const cf = new Cloudflare(token);
-    let accts;
+    let zoneHint = null;
     try {
       const zones = await cf.zones();
-      const acctsList = await this.getAccounts();
-      const id = String(acctsList.length + 1).padStart(2, '0');
-      const encToken = await encryptToken(env.ENCRYPTION_KEY, token);
-      const name = zones.length ? zones[0].name.split('.').slice(-2).join('.') : 'Cloudflare';
-      accts = acctsList;
-      const dup = accts.findIndex((a) => a.name === name);
-      const entry = { id, name, token: encToken, active: true };
-      accts.forEach((a) => { a.active = false; });
-      if (dup >= 0) accts[dup] = entry; else accts.push(entry);
+      zoneHint = zones.length ? zones[0].name : null;
     } catch (e) {
       return { text: `Verifikasi token gagal: <code>${esc(e.message)}</code>`, rows: backCancel(false), tokenConsumed: true };
     }
-    await this.setAccounts(accts);
+
+    try {
+      const encToken = await encryptToken(env.ENCRYPTION_KEY, token);
+      // ID unik dan tidak pernah dipakai ulang: max(id) + 1 per user.
+      const row = await env.DB.prepare(
+        'SELECT COALESCE(MAX(CAST(id AS INTEGER)), 0) AS maxId FROM accounts WHERE user_id = ?')
+        .bind(uidv).first();
+      const nextId = String((Number(row && row.maxId) || 0) + 1).padStart(2, '0');
+
+      // Akun baru jadi aktif, akun lain dinonaktifkan — dalam satu batch.
+      await env.DB.batch([
+        env.DB.prepare('UPDATE accounts SET active = 0 WHERE user_id = ?').bind(uidv),
+        env.DB.prepare(
+          'INSERT INTO accounts (user_id, id, name, token, zone_hint, active, created_at) ' +
+          'VALUES (?, ?, ?, ?, ?, 1, ?)')
+          .bind(uidv, nextId, name, encToken, zoneHint, Date.now()),
+      ]);
+    } catch (e) {
+      return { text: `Gagal menyimpan akun: <code>${esc(e.message)}</code>`, rows: backCancel(false), tokenConsumed: true };
+    }
+
     st.s = 'home'; st.p = {};
     await this.setState(st);
     const home = await this.viewHome(env, uidv);
-    return { ...home, text: '✅ Akun tersimpan (token terenkripsi).\n\n' + home.text, tokenConsumed: true };
+    return {
+      ...home,
+      text: `✅ Akun <b>${esc(name)}</b> tersimpan (token terenkripsi).\n\n` + home.text,
+      tokenConsumed: true,
+    };
+  }
+
+  async renameAccount(env, uidv, st, text) {
+    const name = text.trim().slice(0, 40);
+    const aid = st.p && st.p.aid;
+    if (!name) return { text: 'Nama tidak boleh kosong.', rows: backCancel(false) };
+    if (!aid) return this.viewHome(env, uidv);
+    await env.DB.prepare('UPDATE accounts SET name = ? WHERE user_id = ? AND id = ?')
+      .bind(name, uidv, aid).run();
+    st.s = 'home'; st.p = {};
+    await this.setState(st);
+    const home = await this.viewHome(env, uidv);
+    return { ...home, text: `✅ Nama akun diubah jadi <b>${esc(name)}</b>.\n\n` + home.text };
   }
 }

@@ -7,6 +7,7 @@ Bot Telegram untuk mengelola DNS di banyak akun Cloudflare, berjalan sepenuhnya 
 - **CRUD DNS lengkap** — list, tambah, ubah, hapus, semua lewat inline button.
 - **Semua tipe record** Cloudflare: `A AAAA CNAME TXT MX NS SRV CAA PTR NAPTR HTTPS SVCB URI DS DNSKEY CERT TLSA SMIMEA SSHFP LOC OPENPGPKEY`
 - **Token terenkripsi** AES-256-GCM sebelum disimpan, dan pesan berisi token dihapus otomatis dari chat.
+- **D1 database** untuk akun multi-akun, sesi wizard, dan dedupe update Telegram.
 - **Async & aman** — webhook diverifikasi secret, update dedupe, Durable Object per user (tidak ada race condition saat tombol diklik cepat).
 
 ---
@@ -118,7 +119,27 @@ npx wrangler deploy
 
 ---
 
-## 6. Set Secret
+## 6. Buat dan siapkan database D1
+
+Di Dashboard Cloudflare:
+
+1. Buka **Workers & Pages → D1 SQL Database → Create database**.
+2. Gunakan nama `cf-dns-bot`.
+3. Salin **Database ID** dari halaman database.
+4. Di `wrangler.toml`, ganti:
+   ```toml
+   database_id = "REPLACE_WITH_D1_DATABASE_ID"
+   ```
+   dengan Database ID tersebut.
+5. Jalankan schema ke database remote:
+   ```bash
+   npx wrangler d1 execute cf-dns-bot --remote --file=./schema.sql
+   ```
+6. Commit dan push `wrangler.toml` + `schema.sql`, lalu biarkan GitHub build berjalan.
+
+Binding yang dipakai kode adalah `DB`. Jangan menghapus atau mengganti nama binding ini.
+
+## 7. Set Secret
 
 ### Lewat wrangler (Cara A)
 

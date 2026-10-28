@@ -12,6 +12,13 @@ class_name = "UserBot"
 tag = "v1"
 new_sqlite_classes = ["UserBot"]
 
+# D1 database untuk akun Cloudflare, sesi, dan dedupe update Telegram.
+# Ganti REPLACE_WITH_D1_DATABASE_ID dengan ID database D1 milikmu.
+[[d1_databases]]
+binding = "DB"
+database_name = "cf-bot-dns"
+database_id = "6258a476-0fb4-4a67-80a0-58f7cc91ddee"
+
 # Secret TIDAK ditulis di sini. Set lewat dashboard atau:
 #   wrangler secret put BOT_TOKEN
 #   wrangler secret put WEBHOOK_SECRET
