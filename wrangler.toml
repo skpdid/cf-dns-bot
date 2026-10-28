@@ -1,4 +1,4 @@
-name = "long-heart-857b"
+name = "cf-dns-bot"
 main = "worker.js"
 compatibility_date = "2025-01-01"
 
