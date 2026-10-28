@@ -147,9 +147,14 @@ class CfError extends Error {
 }
 
 class Cloudflare {
-  constructor(token, fetchImpl = fetch) { this.token = token; this.fetch = fetchImpl; }
+  // fetch disimpan terpisah (bukan this.fetch) agar tetap terikat ke globalThis.
+  // Memanggil this.fetch(...) di Workers memicu "Illegal invocation".
+  constructor(token, fetchImpl) {
+    this.token = token;
+    this._fetch = fetchImpl || ((...a) => fetch(...a));
+  }
   async _req(method, path, body) {
-    const res = await this.fetch(`${CF_API}${path}`, {
+    const res = await this._fetch(`${CF_API}${path}`, {
       method,
       headers: { Authorization: `Bearer ${this.token}`, 'Content-Type': 'application/json' },
       body: body === undefined ? undefined : JSON.stringify(body),
