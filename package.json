@@ -1,0 +1,15 @@
+{
+  "name": "cf-dns-bot",
+  "version": "1.0.0",
+  "private": true,
+  "type": "module",
+  "scripts": {
+    "test": "node test/run.mjs",
+    "dev": "wrangler dev",
+    "deploy": "wrangler deploy",
+    "check": "wrangler deploy --dry-run --outdir=dist"
+  },
+  "devDependencies": {
+    "wrangler": "^4.42.0"
+  }
+}
